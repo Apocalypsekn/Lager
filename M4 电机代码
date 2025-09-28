@@ -1,0 +1,256 @@
+// M4_Scurve_goto3_with_homing_CW.ino
+// 立即定位（S-curve）+ 老师式 Homing（固定顺时针）：D2 中断，恒速找零，命中后按 offset 定位。
+// STEP 端口直写（Mega2560→PORTJ.3），其它平台回退到 digitalWrite()。
+// HomeCfg 设置默认偏置；Home 的 offset=-999999 表示使用默认偏置。
+
+#include <Arduino.h>
+#include <math.h>
+#include <RPC.h>
+
+/* 引脚 */
+#define STEP_PIN 31
+#define DIR_PIN  46
+#define EN_PIN   44
+#define REF_PIN   2     // 参考点传感器输入（外部中断口）
+
+/* 机械/运动参数 */
+static const long  PPR              = 5000;
+static const float DEG_PER_REV      = 360.0f;
+static const long  MIN_SPS          = 50;
+static const long  MAX_SPS          = 6000;
+static const float START_FACTOR     = 5.0f;
+static const float RAMP_TOTAL_RATIO = 0.30f;
+
+/* Homing 参数（老师风格：粗搜） */
+static const long  HOME_MAX_SPAN    = PPR * 2;   // 找不到就放弃（最多两圈）
+static const long  HOME_ESCAPE_MAX  = PPR;       // 起始在触发上时的最大脱离步数
+
+/* 状态 */
+static volatile long    current_pos = 0; // [0..PPR-1]
+static volatile uint8_t g_busy      = 0;
+static volatile uint8_t g_stop_req  = 0;
+
+/* Homing 相关（固定顺时针） */
+static volatile uint8_t g_ref_found   = 0;     // ISR 置位
+static          long    g_home_offset = 0;     // 默认偏置
+
+/* —— STEP 端口直写（Mega2560→PORTJ.3），其它平台回退 —— */
+#if defined(PORTJ)
+  #define STEP_DDR   DDRJ
+  #define STEP_PORT  PORTJ
+  #define STEP_BIT   3
+  inline void stepPinInit(){ STEP_DDR |= _BV(STEP_BIT); STEP_PORT &= ~_BV(STEP_BIT); }
+  inline void stepPulseHalf(unsigned int halfDelayUs){
+    STEP_PORT |=  _BV(STEP_BIT); delayMicroseconds(halfDelayUs);
+    STEP_PORT &= ~_BV(STEP_BIT); delayMicroseconds(halfDelayUs);
+  }
+#else
+  inline void stepPinInit(){ pinMode(STEP_PIN, OUTPUT); digitalWrite(STEP_PIN, LOW); }
+  inline void stepPulseHalf(unsigned int halfDelayUs){
+    digitalWrite(STEP_PIN, HIGH); delayMicroseconds(halfDelayUs);
+    digitalWrite(STEP_PIN, LOW ); delayMicroseconds(halfDelayUs);
+  }
+#endif
+
+/* 工具 */
+inline void motorEnable(bool on){ digitalWrite(EN_PIN, on ? LOW : HIGH); }
+inline void motorDir(bool cw){ digitalWrite(DIR_PIN, cw ? HIGH : LOW); }   // true=顺时针
+static inline long wrapMod(long x,long m){ long r=x%m; if(r<0) r+=m; return r; }
+static inline long shortestDelta(long cur,long tgt,long m){
+  long d=tgt-cur; d=(d%m+m)%m; if(d>m/2) d-=m; return d;
+}
+static inline unsigned int spsToHalfUs(long sps){
+  if(sps<MIN_SPS) sps=MIN_SPS; if(sps>MAX_SPS) sps=MAX_SPS;
+  long half = lround(1000000.0/(2.0*(double)sps));
+  if(half<3) half=3; if(half>20000) half=20000;
+  return (unsigned int)half;
+}
+inline bool ref_is_active(){ return digitalRead(REF_PIN)==LOW; }  // 低有效
+
+/* —— S-curve（rampStep：-1 自动；>=0 固定每侧步长） —— */
+static long moveDeltaSCurve3(long delta_steps,long v_sps,long rampStep){
+  if(delta_steps==0) return 0;
+  if(v_sps <= 0) return -20;
+
+  bool forward = (delta_steps > 0);
+  long steps   = labs(delta_steps);
+
+  long rampEach;
+  if(rampStep >= 0) {
+    rampEach = (2*rampStep > steps) ? (steps/2) : rampStep;
+  } else {
+    long each = (long)floorf((float)steps*(RAMP_TOTAL_RATIO*0.5f));
+    if(each==0 && steps>=2) each=1;
+    if(2*each>steps) each=steps/2;
+    rampEach = each;
+  }
+  long constSteps = steps - 2*rampEach;
+  if(constSteps < 0){ constSteps = 0; rampEach = steps/2; }
+
+  unsigned int delayMin   = spsToHalfUs(v_sps);
+  unsigned int delayStart = (unsigned int)(delayMin * START_FACTOR);
+
+  g_stop_req = 0;
+  motorEnable(true);
+  motorDir(forward);
+  g_busy = 1;
+
+  for(long i=0;i<rampEach;i++){
+    if(g_stop_req) break;
+    float f = powf(sinf((float)i / (float)rampEach * PI * 0.5f), 1.5f);
+    unsigned int d = delayStart - (unsigned int)((delayStart - delayMin) * f);
+    stepPulseHalf(d);
+  }
+  for(long i=0;i<constSteps;i++){
+    if(g_stop_req) break;
+    stepPulseHalf(delayMin);
+  }
+  for(long i=rampEach-1;i>=0;i--){
+    if(g_stop_req) break;
+    float f = powf(sinf((float)i / (float)rampEach * PI * 0.5f), 1.5f);
+    unsigned int d = delayStart - (unsigned int)((delayStart - delayMin) * f);
+    stepPulseHalf(d);
+    if(i==0) break;
+  }
+
+  g_busy = 0;
+  return (forward ? steps : -steps);
+}
+
+/* —— 外部中断 ISR：只置标志并立刻关中断 —— */
+void ISR_Ref(){
+  detachInterrupt(digitalPinToInterrupt(REF_PIN));
+  g_ref_found = 1;
+}
+
+// —— 无中断（轮询）版 Homing：固定顺时针粗搜 + offset 定位 —— //
+// 关键点：
+// 1) 全程不用 attachInterrupt/detachInterrupt
+// 2) 每步后直接 digitalRead(REF_PIN) 并做 3 连低去抖
+// 3) 无论 offset 是否为 0，末尾都统一清理：g_busy=0、禁用电机、重置标志
+long rpc_home_run(long offset_steps,long v_sps,long rampStep){
+  if(g_busy) return -10;
+  if(v_sps <= 0) return -20;
+  if(offset_steps == -999999L) offset_steps = g_home_offset;
+
+  // 输入上拉，保证稳态
+  pinMode(REF_PIN, INPUT_PULLUP);
+
+  // 用于恒速搜零
+  unsigned int halfDelay = spsToHalfUs(max(MIN_SPS, v_sps));
+
+  // ── 1) 若一开始就在触发上，先逆时针脱离 ──
+  if(digitalRead(REF_PIN) == LOW){
+    long esc = 0;
+    motorEnable(true);
+    motorDir(false/*CCW*/);
+    while (digitalRead(REF_PIN) == LOW && esc < HOME_ESCAPE_MAX){
+      stepPulseHalf(halfDelay); ++esc;
+    }
+  }
+
+  // ── 2) 顺时针恒速搜零 + 去抖 ──
+  const int  DEBOUNCE_N = 3;        // 连续 N 次低判定命中
+  const long MAX_STEPS  = HOME_MAX_SPAN;
+  long moved = 0;
+  int  low_cnt = 0;
+
+  g_busy = 1;
+  motorEnable(true);
+  motorDir(true/*CW*/);
+
+  while (moved < MAX_STEPS){
+    stepPulseHalf(halfDelay);
+    ++moved;
+
+    if (digitalRead(REF_PIN) == LOW){
+      if (++low_cnt >= DEBOUNCE_N){
+        break;                      // 命中
+      }
+    } else {
+      low_cnt = 0;
+    }
+  }
+
+  // ── 3) 搜索阶段结束：检查是否命中 ──
+  if (low_cnt < DEBOUNCE_N){
+    // 彻底复位为可接收命令的空闲态
+    g_busy = 0;
+    motorEnable(false);
+    // 可选：保持上拉稳定
+    pinMode(REF_PIN, INPUT_PULLUP);
+    return -50;                     // home not found
+  }
+
+  // ── 4) 命中：当前位置归零 ──
+  current_pos = 0;
+
+  // ── 5) 按 offset 用 S-curve 定位（仍用最短路径） ──
+  long target = wrapMod(offset_steps, PPR);
+  long delta  = shortestDelta(current_pos, target, PPR);
+  if (delta != 0){
+    long moved2 = moveDeltaSCurve3(delta, v_sps, rampStep);
+    (void)moved2;
+    current_pos = target;
+  }
+
+  // ── 6) 统一清理，确保后续命令可用 ──
+  g_busy = 0;               // ★不管有没有 offset，都显式清空忙标志
+  motorEnable(false);       // ★禁用驱动，避免持续上电引发误会
+  // 可选：保持参考点上拉，且不挂中断（下次 Home 再跑轮询即可）
+  pinMode(REF_PIN, INPUT_PULLUP);
+
+  return current_pos;
+}
+
+
+
+/* —— 其他 RPC —— */
+long rpc_goto3(long abs_steps,long v_sps,long rampStep){
+  if(g_busy) return -10;
+  long target = wrapMod(abs_steps, PPR);
+  long delta  = shortestDelta(current_pos, target, PPR);
+  if(delta==0) return current_pos;
+  long moved = moveDeltaSCurve3(delta, v_sps, rampStep);
+  (void)moved;
+  current_pos = target;
+  return current_pos;
+}
+long rpc_goto_deg3(long deg_milli,long v_sps,long rampStep){
+  if(g_busy) return -10;
+  float deg=(float)deg_milli/1000.0f;
+  long target_steps = lroundf((deg*(float)PPR)/DEG_PER_REV);
+  return rpc_goto3(target_steps, v_sps, rampStep);
+}
+long rpc_set_pos(long new_pos){
+  if(g_busy) return -10;
+  current_pos = wrapMod(new_pos, PPR);
+  return current_pos;
+}
+long rpc_qpos(){ return current_pos; }
+long rpc_busy(){ return (long)g_busy; }
+
+/* —— HomeCfg：设置默认偏置 —— */
+long rpc_home_cfg(long offset_steps){
+  g_home_offset = offset_steps;
+  return g_home_offset;
+}
+
+/* 绑定 */
+void setup(){
+  RPC.begin();
+
+  pinMode(DIR_PIN,OUTPUT); pinMode(EN_PIN,OUTPUT);
+  motorEnable(false);
+  stepPinInit(); // STEP 端口直写初始化或回退
+
+  RPC.bind("goto3",     rpc_goto3);
+  RPC.bind("goto_deg3", rpc_goto_deg3);
+  RPC.bind("set_pos",   rpc_set_pos);
+  RPC.bind("qpos",      rpc_qpos);
+  RPC.bind("busy",      rpc_busy);
+
+  RPC.bind("home_run",  rpc_home_run);   // 固定顺时针
+  RPC.bind("home_cfg",  rpc_home_cfg);   // 设置默认偏置
+}
+void loop(){}
