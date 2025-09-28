@@ -1,0 +1,162 @@
+// M7_SerialUDP_Proxy_simple_goto3_homing_CW.ino
+// 指令：Position_Seq / Position_deg / SetPos / qpos / busy
+//      Home,<offset_steps>,<v_sps>,<rampStep>
+//      HomeCfg,<offset_steps>,0,0  // 设置默认偏置
+// 说明：第4参 rampStep：-1=自动斜坡（总30%）；>=0=每侧固定步长
+
+#include <Arduino.h>
+#include <ctype.h>
+#include <string.h>
+#include <stdio.h>
+#include <SPI.h>
+#include <Ethernet2.h>
+#include <EthernetUdp2.h>
+#include <RPC.h>
+
+static const long PPR = 5000;
+
+byte mac[] = {0xA8,0x61,0x0A,0xAE,0x85,0x2E};
+IPAddress ip(192,168,178,5);
+IPAddress subnet(255,255,255,0);
+unsigned int localPort = 8888;
+EthernetUDP Udp;
+
+#define BUF_SIZE 64
+char   packetBuffer[BUF_SIZE] = {0};
+String lineBuf;
+
+IPAddress lastRemoteIP;
+uint16_t  lastRemotePort = 0;
+
+const char* explainErr(long code){
+  switch(code){
+    case -10: return "busy: motor is moving";
+    case -20: return "invalid v_sps (must be > 0)";
+    case -21: return "invalid ramp parameter";
+    case -41: return "bad argument";
+    case -50: return "home not found";
+    default:  return "unknown error";
+  }
+}
+
+void replyText(const char* s){
+  Serial.println(s);
+  if(lastRemotePort){
+    Udp.beginPacket(lastRemoteIP,lastRemotePort);
+    Udp.write((const uint8_t*)s, strlen(s));
+    Udp.endPacket();
+  }
+}
+void replyERR(long code){
+  char msg[96]; snprintf(msg,sizeof(msg),"ERR CODE=%ld MSG=%s",code,explainErr(code));
+  replyText(msg);
+}
+void replyOK_Pos(long pos){
+  float deg = (float)pos * 360.0f / (float)PPR;
+  char msg[64]; snprintf(msg,sizeof(msg),"OK POS=%ld DEG=%.3f",pos,deg);
+  replyText(msg);
+}
+
+bool equalsIgnoreCase(const char* a, const char* b){
+  while(*a && *b){ if(tolower((unsigned char)*a)!=tolower((unsigned char)*b)) return false; ++a; ++b; }
+  return *a=='\0' && *b=='\0';
+}
+void trimSpaces(char* s){
+  char* p=s; while(*p==' '||*p=='\t') ++p; if(p!=s) memmove(s,p,strlen(p)+1);
+  int n=strlen(s); while(n>0 && (s[n-1]==' '||s[n-1]=='\t'||s[n-1]=='\r'||s[n-1]=='\n')) s[--n]='\0';
+}
+
+void handleCsvLine(const char* buf, bool fromUDP){
+  if(fromUDP){ lastRemoteIP=Udp.remoteIP(); lastRemotePort=Udp.remotePort(); }
+
+  // 无逗号工具指令
+  if(equalsIgnoreCase(buf,"qpos")){
+    long pos=RPC.call("qpos").as<long>(); if(pos>=0) replyOK_Pos(pos); else replyERR(pos); return;
+  }
+  if(equalsIgnoreCase(buf,"busy")){
+    long b=RPC.call("busy").as<long>();
+    if(b>=0){ char m[24]; snprintf(m,sizeof(m),"OK busy=%ld",b); replyText(m);} else replyERR(b);
+    return;
+  }
+
+  // CSV：Mode,Param1,Param2,Param3
+  char temp[BUF_SIZE]; strncpy(temp,buf,BUF_SIZE-1); temp[BUF_SIZE-1]=0;
+  char* tok=strtok(temp,","); if(!tok){ replyText("ERR CODE=-1 MSG=bad format"); return; }
+  char mode[20]={0}; strncpy(mode,tok,sizeof(mode)-1); trimSpaces(mode);
+
+  tok=strtok(NULL,","); if(!tok){ replyText("ERR CODE=-1 MSG=bad args"); return; } trimSpaces(tok);
+  long p1=atol(tok);
+
+  tok=strtok(NULL,","); if(!tok){ replyText("ERR CODE=-1 MSG=bad args"); return; } trimSpaces(tok);
+  long p2=atol(tok);
+
+  tok=strtok(NULL,","); if(!tok){ replyText("ERR CODE=-1 MSG=bad args"); return; } trimSpaces(tok);
+  long p3=atol(tok);
+
+  if(equalsIgnoreCase(mode,"Position_Seq")){
+    if(p2<=0){ replyERR(-20); return; }
+    long pos=RPC.call("goto3", p1, p2, p3).as<long>();
+    if(pos>=0) replyOK_Pos(pos); else replyERR(pos);
+    return;
+  }
+  if(equalsIgnoreCase(mode,"Position_deg")){
+    if(p2<=0){ replyERR(-20); return; }
+    long pos=RPC.call("goto_deg3", p1, p2, p3).as<long>();
+    if(pos>=0) replyOK_Pos(pos); else replyERR(pos);
+    return;
+  }
+  if(equalsIgnoreCase(mode,"SetPos")){
+    long r=RPC.call("set_pos", p1).as<long>();
+    if(r>=0) replyText("OK SetPos"); else replyERR(r);
+    return;
+  }
+  if(equalsIgnoreCase(mode,"Home")){
+    if(p2<=0){ replyERR(-20); return; }
+    long pos=RPC.call("home_run", p1, p2, p3).as<long>(); // 默认顺时针
+    if(pos>=0) replyOK_Pos(pos); else replyERR(pos);
+    return;
+  }
+  if(equalsIgnoreCase(mode,"HomeCfg")){
+    long r=RPC.call("home_cfg", p1).as<long>();           // 设置默认偏置
+    if(r>=0) replyText("OK home_cfg"); else replyERR(r);
+    return;
+  }
+
+  replyText("ERR CODE=-1 MSG=unknown mode");
+}
+
+void setup(){
+  Serial.begin(19200);
+  RPC.begin();
+  Ethernet.begin(mac, ip);
+  Ethernet.init(10);
+  Udp.begin(localPort);
+
+  Serial.println(F("M7 ready (CW homing). Use:"));
+  Serial.println(F("  Position_Seq,<steps>,<v_sps>,<RampStep>"));
+  Serial.println(F("  Position_deg,<mdeg>,<v_sps>,<RampStep>"));
+  Serial.println(F("  SetPos,<new_pos>,0,0"));
+  Serial.println(F("  Home,<offset_steps>,<v_sps>,<rampStep>   // 顺时针找零"));
+  Serial.println(F("  HomeCfg,<offset_steps>,0,0                // 设置默认偏置"));
+  Serial.println(F("  qpos | busy"));
+}
+
+void loop(){
+  while(Serial.available()){
+    char c=Serial.read();
+    if(c=='\r'||c=='\n'){
+      lineBuf.trim();
+      if(lineBuf.length()){ lineBuf.toCharArray(packetBuffer,BUF_SIZE); handleCsvLine(packetBuffer,false); }
+      lineBuf="";
+    }else{
+      lineBuf+=c; if(lineBuf.length()>BUF_SIZE-2) lineBuf.remove(0);
+    }
+  }
+  int packetSize=Udp.parsePacket();
+  if(packetSize){
+    memset(packetBuffer,0,BUF_SIZE);
+    Udp.read(packetBuffer,BUF_SIZE-1);
+    handleCsvLine(packetBuffer,true);
+  }
+  while(RPC.available()) Serial.write(RPC.read());
+}

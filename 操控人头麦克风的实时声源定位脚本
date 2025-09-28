@@ -1,0 +1,195 @@
+%% Beschreibung
+% Dieses Skript wird genutzt, um in Echtzeit eine Schallquelle zu Orten und
+% den Kunstkopf in diese Richtung zu drehen.
+% Es muss aus dem Hauptordner des GIT-Projekts ausgeführt werden. Da es in
+% Echtzeit funktioniert. Muss außerdem ein passendes Gerät um Audiosignale
+% aufzunehmen angeschlossen sein.
+addpath(genpath('Base'))
+
+%% Parameterdefinitionen
+fs = 16000; %Abtastrate
+% Parameter der Frequenztransformation (Achtung muss an HRTF angepasst
+% sein)
+window_size = 1024; 
+Nfft = 1024;
+
+%Audio Device
+selected_device = 'MOTU Pro Audio';
+
+%Motor
+IP = "192.168.178.5";
+max_speed = 45;%Maximale Drehgeschwindigkeit in Grad pro Sekunde
+motor_refresh_time = 0.2; % Zeitintervall, welches abgewartet wird, bis der Motor das nächste mal angesteuert wird
+
+% %Glättungs/Ausreißerparameter
+inlier_buffer_size = 30;
+outlier_threshold = 10; % Ab einer Winkelabweichung über 10° wird er als Ausreißer angesehen
+outlier_buffer_size = 10;
+outlier_counter = 0;
+outlier_number_threshold = 2;
+outlier_deviation_threshold = 20;
+
+% Parameter für die Echtzeit-Lokalisierung
+cov_mat_smoothing = 0.8;    % Glättungsfaktor für Local TBF
+
+%Lokalisierte Winkel werden nur genutzt wenn:
+% 2. der Winkel als "sicher" gilt. D.h. der Winkel prägnant im
+% Lokalisierungsalgorithmus war.
+conciseness_threshold = 1.4;
+% 1. diese im definierten absoluten Winkelbereich sind. Falls sie darüber
+% hinaus gehen, werden sie geklippt.
+max_abs_angle = 90;
+min_abs_angle = -90;
+
+current_angle = 0;
+target_angle = 0;
+
+%Die Lokalisierung wird nur genutzt, wenn die momentane Leistung einen Schwellwert
+%übersteigt und ansteigend (bzw. um einen Faktor größer als der rekursive
+%Mittelwert ist)
+peak_power = 0;
+power_recursive_smoothing_factor = 0.5;%1-0 je näher an 1 desto stärker die Glättung
+power_increase_threshold = 1.2;
+power_threshold = 1e-03;
+
+%% Initialisierung
+audioToDevice = zeros(window_size, 1);
+aPR = audioPlayerRecorder('Device', selected_device, 'SampleRate', 48000,'BufferSize',window_size);
+aPR.RecorderChannelMapping = [1,2,5,6];
+
+% Lade HRTF-Daten
+load(fullfile('Data','HRTF_matrix_-90to90.mat'));
+HRTF_data = HRTF_data;
+num_channel = size(HRTF_data.HRTF, 3);
+if(num_channel~=length(aPR.RecorderChannelMapping))
+    warning('Kanalanzahl des Eingangssignals passt nicht zu genutzten HRTF-Daten. HRTF-Daten werden gekürzt.')
+    HRTF_data.HRTF = HRTF_data.HRTF(:,:,aPR.RecorderChannelMapping);
+    %error('Kanalanzahl des Eingangssignals passt nicht zu genutzten HRTF-Daten')
+end
+
+% Infos für Local TBF
+sample_cov_matrix_total = zeros(num_channel, num_channel, 100); 
+for nFreq = 1:size(sample_cov_matrix_total,3)
+    sample_cov_matrix_total(:, :, nFreq) = eye(num_channel);
+end
+
+% Init Motor Control
+if(~exist('u','var'))
+    u = udpport("IPV4", "LocalPort", 8888);
+else
+    if(isempty(u))
+        u = udpport("IPV4", "LocalPort", 8888);
+    end
+end
+
+% Position Reset to 0
+send = 'Home,-999999,800,-1';
+write(u, send, "uint8", IP, 8888);
+pause(0.3);
+
+
+tracked_data = [];
+saved_trajectory = [];
+outlier_buffer = [];
+inlier_buffer = [];
+
+motor_time_buffer_size = 10;
+motor_time_buffer = [motor_refresh_time;motor_refresh_time;motor_refresh_time];
+
+tic   % ← 新增：启动计时器
+
+%%
+while true
+    [audioFromDevice] = aPR(audioToDevice);
+    resampled_sig = resample(audioFromDevice, fs, aPR.SampleRate);
+    sig = resampled_sig;
+    
+    instant_power = mean(abs(sig),'all');
+    peak_power = (1-power_recursive_smoothing_factor)*instant_power+power_recursive_smoothing_factor*peak_power;
+    if(instant_power>power_threshold && instant_power>peak_power*power_increase_threshold)
+        spec = fft(sig, Nfft);
+        [relative_angle, sample_cov_matrix_total,conciseness] = LOCAL_TBF_fast(spec, HRTF_data, sample_cov_matrix_total, cov_mat_smoothing);
+        
+        new_data = abs([instant_power,peak_power,relative_angle,conciseness]);
+        tracked_data=[tracked_data;new_data];
+        %relative_angle = -relative_angle;
+        if(conciseness>conciseness_threshold)
+
+            abs_angle = -(relative_angle - current_angle);
+            abs_angle = min(max_abs_angle,max(min_abs_angle,abs_angle));
+        
+            %___________Ausreißer/Fehler aus erkannten Winkel entfernen und glätten
+            %um einen Zielwinkel zu schätzen
+            
+            % Winkel, die zu stark von der aktuellen Zielrichtung abweichen werden in
+            % einen eigenen Buffer gespeichert.
+            if abs(abs_angle-target_angle) > outlier_threshold
+                outlier_buffer = ring_buffer(outlier_buffer, abs_angle,outlier_buffer_size);
+                outlier_counter = outlier_counter+1;
+                % Wenn die Häufigkeit dieser Ausreißer der aktuellen Richtung überwiegt
+                % und wenn die Ausreißer gegen eine bestimmte Richtung konvergieren wird
+                % diese als neue Zielrichtung verwendet
+                if(std(outlier_buffer)<outlier_deviation_threshold && outlier_counter>=outlier_number_threshold)
+                    target_angle = median(outlier_buffer);
+                    outlier_counter = 0;
+                    outlier_buffer = [];
+                    inlier_buffer = ones(inlier_buffer_size,1)*target_angle;
+                end
+            else
+                % Gleitenden Mittelwert berechnen für nicht-Ausreißer
+                inlier_buffer = ring_buffer(inlier_buffer, abs_angle,inlier_buffer_size);
+                outlier_counter = max(0,outlier_counter-1);
+                target_angle = mean(inlier_buffer);
+            end
+            
+        end
+    end
+
+    %% _____________ Motorbewegung _____________
+        if (toc > motor_refresh_time)
+            % 1) 先限速更新 current_angle（老师原逻辑）
+            angle_diff = target_angle - current_angle;
+            if abs(angle_diff) > max_speed * motor_refresh_time
+                angle_diff = sign(angle_diff) * max_speed * motor_refresh_time;
+            end
+            current_angle = current_angle + angle_diff;
+        
+            % 2) 目标角（度，0..360）
+            target_deg = mod(-current_angle, 360);
+        
+            % 3) 本次角差（度，取最短路到 [-180,180]）
+            delta = mod(target_deg - current_angle + 180, 360) - 180;
+        
+            % 4) 把"希望 T 秒完成"转为角速度，再转步/秒（v_sps）
+            T = motor_refresh_time;                 % 例如 0.2 s
+            omega_deg_s = abs(delta) / max(T, 0.02);
+            omega_deg_s = min(omega_deg_s, max_speed);
+        
+            PPR = 5000;                             % 固件设定
+            v_sps = round( omega_deg_s * (PPR/360) );
+            v_sps = min(6000, max(50, v_sps));      % 夹到固件允许范围
+        
+            % 5) 角度转毫度，斜坡用自动
+            mdeg = round(target_deg * 1000);        % 90° → 90000
+            ramp = -1;
+        
+            % 6) 发送我们协议
+            cmd = sprintf('Position_deg,%d,%d,%d', mdeg, v_sps, ramp);
+            write(u, cmd, "uint8", IP, 8888);
+            disp(['Send to Arduino: ', cmd]);
+        
+            % 7) 记录并重置节拍
+            dt = toc;                                % 本次间隔
+            saved_trajectory = [saved_trajectory; target_deg, dt];
+            tic                                       % 重置计时（保持 0.2 s 节拍）
+        end
+end
+
+time = cumsum(saved_trajectory(:,2));
+figure;
+subplot(2,1,1);
+plot(time,saved_trajectory(:,1));
+subplot(2,1,2);
+plot(saved_trajectory(:,1));
+
+median(saved_trajectory(:,2))

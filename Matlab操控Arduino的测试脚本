@@ -1,0 +1,214 @@
+function motor_test()
+%%  ===== Benutzerparameter =====
+% Port hier anpassen, siehe serialportlist("available")
+COM_PORT = "COM3"; 
+BAUD     = 19200;
+MAX_SPS  = 6000;        % Geschwindigkeitslimit der Firmware (Steps/s), zur Zeitabschätzung
+PPR      = 5000;        % Schritte pro Umdrehung in der Firmware
+
+%% ===== Sichere Port-Öffnung =====
+
+% 清理旧对象(兼容老接口)  Alte Objekte bereinigen (kompatibel mit älterem Interface)
+instrreset; 
+
+% 如果上次残留，把它清掉  Falls ein Handle aus der letzten Sitzung existiert, bereinigen
+if evalin('base','exist(''s'',''var'')'),   
+    
+    evalin('base','try, flush(s); end; clear s; pause(0.3);');
+end
+s = serialport(COM_PORT, BAUD, "Timeout", 1.0);
+configureTerminator(s, "LF");             % 我们的回包以 '\n' 结尾  Antworten enden mit '\n'
+flush(s);
+pause(0.3);
+disp("PORT OPEN ✔");
+
+% 把句柄放进 base，方便你出错后手动清：clear s; instrreset
+% Handle in den Base-Workspace legen, damit manuell aufräumen möglich ist
+assignin('base','s',s);
+
+%% ===== Demo：Homing → nacheinander zu mehreren Winkeln (blockierende Ausführung) =====
+try
+    % 1) 回零并按偏置 4025 步定位（阻塞等待完成，最多等 12s）
+    % Homing und mit Offset 4025 Steps positionieren (blockierend, max. 12 s warten)
+    homeBlocking(s, 4025, 800, -1, 12);
+    
+    % 2) 把当前位置标定为 0（SetPos 不会运动，一般无需等 busy）
+    % Aktuelle Position als 0 kalibrieren (SetPos bewegt nicht; i. d. R. kein Busy-Wait nötig)
+    writeline(s, 'SetPos,0,0,0');
+    disp('Send: SetPos,0,0,0');
+    
+    % 可选：读一次 qpos 确认为 0
+    % Optional: Einmal qpos lesen, um 0 zu verifizieren
+    posDeg = qposDeg(s);
+    fprintf('Now at DEG=%.3f (expect ~0)\n', posDeg);
+
+    % 3) 目标点列表（单位=度）
+    % Zielliste (Einheit = Grad)
+    goals = [350, 90, 10, 270, 70, 0, 170, 190, 90, 0];
+    % REAL GOAL IST [10, 270, 350, 90, 290, 0]
+    for g = goals
+        % 估一个合适的速度：尽量 0.2~1s 内完成，且不超上限
+        % Passende Geschwindigkeit abschätzen: möglichst in 0.2–1 s fertig und Limit nicht überschreiten
+        
+        % Aktueller Winkel (0..360)
+        cur = qposDeg(s);                        
+        
+        % Winkeldifferenz entlang des kürzesten Wegs  最短路径角差
+        d   = shortestDeltaDeg(cur, g);           
+       
+        % Grobe Zielzeit  粗略目标时间
+        T   = max(0.2, min(1.0, abs(d)/60));   
+        
+        v_sps = round(min(MAX_SPS, abs(d)/T * (PPR/360)));
+        % Untere Geschwindigkeitsgrenze der Firmware 固件下限
+        if v_sps < 50, v_sps = 50; end           
+     
+        % Maximal 8 s auf Bewegungsende warten
+        gotoDegBlocking(s, g, v_sps, -1, 8);      
+        
+        % s: Serialport info\
+        % g: Zielwinkel
+        % v_sps: max Geschwindigkeit pro Bewegung
+        % -1: Rampenfaktor (-1 = Automatisch)
+        %  8: 8 Sekunden wird maximal auf das Ende einer Bewegung gewartet.
+    end
+
+    disp("DONE.");
+catch ME
+    warning("发生异常：%s", ME.message);
+    % Ausnahme/Fehler aufgetreten
+end
+
+%% ===== Sichere Port-Schließung =====
+try, flush(s); end
+clear s
+instrreset;
+disp("PORT CLOSED ✔");
+end
+
+%% ================= Hilfsfunktionen =================
+function ok = gotoDegBlocking(s, deg_target, v_sps, ramp, tMax)
+% 发送绝对角度指令并等待电机空闲
+% Absoluten Winkelbefehl senden und auf Leerlauf (Idle) warten
+
+%Grad zu steps -> Multiplikation mit 1000           % 0..360 → 毫度
+mdeg = round(mod(deg_target,360)*1000);
+
+cmd  = sprintf('Position_deg,%d,%d,%d', mdeg, v_sps, ramp);
+writeline(s, cmd);
+fprintf("Send: %s\n", cmd);
+
+% Von Busy zu Idle warten
+ok = waitIdle(s, tMax);                          
+
+if ~ok
+    warning("Timeout waiting idle (Goto %.3f°).", deg_target);
+    % Timeout beim Warten auf Idle (Goto)
+end
+end
+
+function ok = homeBlocking(s, offset_steps, v_sps, ramp, tMax)
+% 发送 Home 并等待空闲
+% Homing-Befehl senden und auf Idle warten
+cmd = sprintf('Home,%d,%d,%d', offset_steps, v_sps, ramp);
+writeline(s, cmd);
+fprintf("Send: %s\n", cmd);
+
+ok = waitIdle(s, tMax);
+if ~ok
+    warning("Timeout waiting idle (Home).");
+    % Timeout beim Warten auf Idle (Home)
+end
+end
+
+function posDeg = qposDeg(s)
+% 发送 qpos，解析 "OK POS=xxx DEG=yyy" 中的角度（解析失败就返回 NaN）
+% qpos senden und Winkel aus "OK POS=xxx DEG=yyy" parsen (bei Fehlschlag NaN)
+flush(s);
+writeline(s, 'qpos');
+tEnd = tic;
+posDeg = NaN;
+while toc(tEnd) < 1.5
+    lines = readLinesOnce(s);
+    if isempty(lines), pause(0.05); continue; end
+    for i=1:numel(lines)
+        L = string(strtrim(lines{i}));
+        % 既兼容 M7 透传行，也兼容无前缀行
+        % Kompatibel mit M7-Prefix wie auch mit Zeilen ohne Prefix
+        k = strfind(L, "DEG=");
+        if ~isempty(k)
+            val = extractAfter(L, k+3);
+            v   = sscanf(val, "%f");
+            if ~isempty(v), posDeg = v(1); return; end
+        end
+    end
+end
+end
+
+function ok = waitIdle(s, tMax)
+% 轮询 busy，直到 busy=0 或超时
+% Busy-Status abfragen, bis busy=0 oder Timeout
+% 会读取并打印来自 M7 的回包（含 "[M7] OK POS=..."）
+% Liest und druckt Rückmeldungen vom M7 (inkl. "[M7] OK POS=...")
+t0 = tic;
+ok = false;
+while toc(t0) < tMax
+    flush(s);                      % 清旧回包，避免误判  Alte Antworten verwerfen, Fehlinterpretationen vermeiden
+    
+    writeline(s, 'busy');          % 请求忙闲  Busy/Idle-Status anfragen
+     
+    tPoll = tic;
+    gotBusy = false;
+    while toc(tPoll) < 0.6         % 等这一轮回包  Auf Antwort dieser Abfrage-Runde warten
+        
+        lines = readLinesOnce(s);
+        if ~isempty(lines)
+            for i=1:numel(lines)
+                L = strtrim(lines{i});
+                if L ~= ""
+                    disp("[M7] " + L);
+                    if contains(L, "busy=")
+                        gotBusy = true;
+                        b = sscanf(L, 'OK busy=%d');
+                        if ~isempty(b) && b(1) == 0
+                            ok = true; return;    % 空闲  Leerlauf erreicht 
+                        end
+                    end
+                end
+            end
+        else
+            pause(0.05);
+        end
+    end
+    if ~gotBusy
+        % 没等到 busy 回包，继续下一轮
+        % Keine busy-Rückmeldung erhalten, nächste Runde fortsetzen
+        pause(0.1);
+    end
+end
+end
+
+function lines = readLinesOnce(s)
+% 读取当前缓冲区的所有完整行（以 LF 终止）
+% Alle vollständigen Zeilen aus dem aktuellen Puffer lesen (endet mit LF)
+lines = {};
+bytes = s.NumBytesAvailable;
+if bytes <= 0, return; end
+% 逐行读，直到没有可读或读超时
+% Zeilenweise lesen, bis nichts mehr verfügbar ist oder Timeout auftritt
+for k=1:50
+    try
+        L = readline(s); % 受 Timeout 影响  Von Timeout beeinflusst
+        lines{end+1} = char(L); %#ok<AGROW>
+        if s.NumBytesAvailable == 0, break; end
+    catch
+        break;
+    end
+end
+end
+
+function d = shortestDeltaDeg(a, b)
+% 返回从 a 到 b 的最短角差（范围 [-180, 180]）
+% Kürzeste Winkeldifferenz von a nach b (Bereich [-180, 180])
+d = mod(b - a + 180, 360) - 180;
+end
